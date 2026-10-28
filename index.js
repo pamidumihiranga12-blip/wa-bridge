@@ -48,12 +48,19 @@ if (!existsSync(SESSIONS_BASE)) {
 // ============================================
 // HELPER: Format Phone to JID
 // ============================================
-function formatJID(phone) {
-    phone = phone.replace(/[^0-9]/g, '');
-    if (phone.startsWith('0') && phone.length === 10) {
-        phone = '94' + phone.substring(1);
+function formatJID(jidOrPhone) {
+    if (typeof jidOrPhone !== 'string') return '';
+    if (jidOrPhone.includes('@')) {
+        return jidOrPhone.replace('@c.us', '@s.whatsapp.net');
     }
-    return phone + '@s.whatsapp.net';
+    const clean = jidOrPhone.replace(/[^0-9]/g, '');
+    if (clean.length > 13) {
+        return clean + '@lid';
+    }
+    if (clean.startsWith('0') && clean.length === 10) {
+        return '94' + clean.substring(1) + '@s.whatsapp.net';
+    }
+    return clean + '@s.whatsapp.net';
 }
 
 function extractMessageText(msg) {
@@ -91,7 +98,7 @@ async function notifyPHPStatus(merchantId, event, data) {
     }
 }
 
-async function forwardMessageToPHP(merchantId, phone, name, messageText, messageId, sock) {
+async function forwardMessageToPHP(merchantId, phone, name, messageText, messageId, sock, remoteJid) {
     try {
         const response = await fetch(`${PHP_BACKEND_URL}/api/bridge_receive.php`, {
             method: 'POST',
@@ -119,19 +126,28 @@ async function forwardMessageToPHP(merchantId, phone, name, messageText, message
 
         // If PHP returns a reply, send it out immediately via WhatsApp
         if (result && result.reply && sock) {
-            const jid = formatJID(phone);
+            const targetJid = remoteJid || formatJID(phone);
 
             // Natural typing delay
             try {
-                await sock.sendPresenceUpdate('composing', jid);
-                await delay(800 + Math.random() * 1200);
-                await sock.sendPresenceUpdate('paused', jid);
+                await sock.sendPresenceUpdate('composing', targetJid);
+                await delay(600 + Math.random() * 800);
+                await sock.sendPresenceUpdate('paused', targetJid);
             } catch (e) {
                 // ignore presence error
             }
 
-            await sock.sendMessage(jid, { text: result.reply });
-            console.log(`[Merchant ${merchantId}] 📤 Sent reply to ${phone}: ${result.reply.substring(0, 40)}...`);
+            try {
+                await sock.sendMessage(targetJid, { text: result.reply });
+                console.log(`[Merchant ${merchantId}] 📤 Sent reply to ${targetJid}: ${result.reply.substring(0, 40)}...`);
+            } catch (sendErr) {
+                console.warn(`[Merchant ${merchantId}] Failed to send to ${targetJid}, trying fallback:`, sendErr.message);
+                if (targetJid && targetJid.includes('@lid')) {
+                    const fallbackJid = formatJID(phone);
+                    await sock.sendMessage(fallbackJid, { text: result.reply });
+                    console.log(`[Merchant ${merchantId}] 📤 Fallback sent to ${fallbackJid}`);
+                }
+            }
         }
 
     } catch (err) {
@@ -278,7 +294,7 @@ async function connectSession(merchantId) {
 
             console.log(`[Merchant ${id}] 📩 Incoming from ${senderName} (${senderPhone}): "${messageText}"`);
 
-            await forwardMessageToPHP(id, senderPhone, senderName, messageText, msg.key.id, sock);
+            await forwardMessageToPHP(id, senderPhone, senderName, messageText, msg.key.id, sock, senderJID);
         }
     });
 
