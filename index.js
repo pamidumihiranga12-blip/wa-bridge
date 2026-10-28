@@ -11,7 +11,6 @@ import makeWASocket, {
     useMultiFileAuthState,
     DisconnectReason,
     fetchLatestBaileysVersion,
-    makeInMemoryStore,
     Browsers,
     delay,
 } from '@whiskeysockets/baileys';
@@ -155,7 +154,6 @@ async function getOrCreateSession(merchantId) {
         qrCodeData: null,
         connectionState: 'disconnected', // disconnected | connecting | connected
         phone: null,
-        store: makeInMemoryStore({ logger }),
         reconnectTimer: null,
     };
 
@@ -199,7 +197,6 @@ async function connectSession(merchantId) {
     });
 
     session.sock = sock;
-    session.store.bind(sock.ev);
 
     // ==========================================
     // Event: Connection Update
