@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: whatsapp-baileys-bridge
+    runtime: node
+    plan: free
+    region: singapore
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: NODE_VERSION
+        value: 18.18.0
+      - key: PHP_BACKEND_URL
+        value: https://smartzonelk.com.lk
+      - key: BRIDGE_SECRET
+        value: smartzone_baileys_secret_2026
+

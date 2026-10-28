@@ -1,0 +1,24 @@
+{
+  "name": "wa-baileys-bridge",
+  "version": "1.0.0",
+  "description": "WhatsApp Baileys Bridge - Connects to PHP backend",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.9",
+    "express": "^4.18.2",
+    "pino": "^8.17.2",
+    "qrcode-terminal": "^0.12.0",
+    "node-fetch": "^3.3.2",
+    "dotenv": "^16.3.1",
+    "qrcode": "^1.5.3"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
+
