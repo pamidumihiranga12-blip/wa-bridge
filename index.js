@@ -3,7 +3,7 @@
  * =====================================
  * - Supports MULTIPLE merchants simultaneously (Multi-Tenant)
  * - Each merchant has an isolated session in ./sessions/merchant_<id>
- * - Unlimited contacts and messages (100% Free)
+ * - Multi-tenant WhatsApp AI Assistant Bridge
  * - Connects to PHP backend (https://smartzonelk.com.lk)
  */
 
