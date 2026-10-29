@@ -19,7 +19,7 @@ import pino from 'pino';
 import fetch from 'node-fetch';
 import qrcode from 'qrcode';
 import { Boom } from '@hapi/boom';
-import { mkdir, readdir, rm } from 'fs/promises';
+import { mkdir, readdir, rm, readFile, writeFile } from 'fs/promises';
 import { existsSync } from 'fs';
 import path from 'path';
 import 'dotenv/config';
@@ -178,6 +178,109 @@ async function getOrCreateSession(merchantId) {
 }
 
 // ============================================
+// CLOUD PERSISTENCE HELPERS (MySQL Sync via PHP)
+// ============================================
+const syncDebounceTimers = new Map();
+
+function scheduleCloudSync(merchantId) {
+    const id = String(merchantId);
+    if (syncDebounceTimers.has(id)) {
+        clearTimeout(syncDebounceTimers.get(id));
+    }
+    const timer = setTimeout(async () => {
+        syncDebounceTimers.delete(id);
+        await syncSessionToCloud(id);
+    }, 3500); // Debounce 3.5 seconds
+    syncDebounceTimers.set(id, timer);
+}
+
+async function syncSessionToCloud(merchantId) {
+    const id = String(merchantId);
+    const sessionDir = path.join(SESSIONS_BASE, `merchant_${id}`);
+    if (!existsSync(sessionDir)) return;
+
+    try {
+        const fileNames = await readdir(sessionDir);
+        const filesObj = {};
+        for (const f of fileNames) {
+            const filePath = path.join(sessionDir, f);
+            const content = await readFile(filePath);
+            filesObj[f] = content.toString('base64');
+        }
+
+        if (Object.keys(filesObj).length === 0 || !filesObj['creds.json']) return;
+
+        console.log(`[Merchant ${id}] 📤 Syncing ${Object.keys(filesObj).length} session files to cloud backup...`);
+        const res = await fetch(`${PHP_BACKEND_URL}/api/bridge_session_sync.php`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-Bridge-Secret': BRIDGE_SECRET,
+            },
+            body: JSON.stringify({
+                action: 'save',
+                merchant_id: parseInt(id, 10),
+                files: filesObj,
+            }),
+            signal: AbortSignal.timeout(15000),
+        });
+        const result = await res.json();
+        if (result && result.success) {
+            console.log(`[Merchant ${id}] ☁️ Cloud backup synced successfully!`);
+        }
+    } catch (e) {
+        console.warn(`[Merchant ${id}] Cloud sync error:`, e.message);
+    }
+}
+
+async function restoreSessionFromCloud(merchantId) {
+    const id = String(merchantId);
+    const sessionDir = path.join(SESSIONS_BASE, `merchant_${id}`);
+    try {
+        console.log(`[Merchant ${id}] 📥 Checking cloud backup for saved credentials...`);
+        const res = await fetch(`${PHP_BACKEND_URL}/api/bridge_session_sync.php?action=load&merchant_id=${id}`, {
+            headers: { 'X-Bridge-Secret': BRIDGE_SECRET },
+            signal: AbortSignal.timeout(10000),
+        });
+        if (!res.ok) return false;
+        const data = await res.json();
+        if (data && data.success && data.files && data.files['creds.json']) {
+            if (!existsSync(sessionDir)) {
+                await mkdir(sessionDir, { recursive: true });
+            }
+            for (const [fileName, base64Content] of Object.entries(data.files)) {
+                const filePath = path.join(sessionDir, fileName);
+                const buf = Buffer.from(base64Content, 'base64');
+                await writeFile(filePath, buf);
+            }
+            console.log(`[Merchant ${id}] ✅ Restored ${Object.keys(data.files).length} session files from cloud!`);
+            return true;
+        }
+    } catch (e) {
+        console.warn(`[Merchant ${id}] Failed to restore session from cloud:`, e.message);
+    }
+    return false;
+}
+
+async function deleteSessionFromCloud(merchantId) {
+    const id = String(merchantId);
+    try {
+        await fetch(`${PHP_BACKEND_URL}/api/bridge_session_sync.php`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-Bridge-Secret': BRIDGE_SECRET,
+            },
+            body: JSON.stringify({
+                action: 'delete',
+                merchant_id: parseInt(id, 10),
+            }),
+            signal: AbortSignal.timeout(8000),
+        });
+    } catch (e) {}
+}
+
+// ============================================
 // CONNECT SESSION TO WHATSAPP
 // ============================================
 async function connectSession(merchantId) {
@@ -193,6 +296,11 @@ async function connectSession(merchantId) {
 
     if (!existsSync(sessionDir)) {
         await mkdir(sessionDir, { recursive: true });
+    }
+
+    // If local creds are missing (e.g. after Render container restart), restore from MySQL cloud backup
+    if (!existsSync(path.join(sessionDir, 'creds.json'))) {
+        await restoreSessionFromCloud(id);
     }
 
     console.log(`[Merchant ${id}] 🔄 Connecting session...`);
@@ -242,6 +350,7 @@ async function connectSession(merchantId) {
                 console.log(`[Merchant ${id}] 🚪 Logged out. Session cleared.`);
                 session.phone = null;
                 await notifyPHPStatus(id, 'disconnected', { reason: 'logged_out' });
+                await deleteSessionFromCloud(id);
                 // Clean auth directory for fresh start
                 try {
                     await rm(sessionDir, { recursive: true, force: true });
@@ -266,13 +375,19 @@ async function connectSession(merchantId) {
                 phone: session.phone,
                 name: sock.user?.name || null,
             });
+
+            // Ensure credentials are backed up immediately after successful link
+            scheduleCloudSync(id);
         }
     });
 
     // ==========================================
-    // Event: Save Credentials
+    // Event: Save Credentials (Local + Cloud Backup)
     // ==========================================
-    sock.ev.on('creds.update', saveCreds);
+    sock.ev.on('creds.update', async () => {
+        await saveCreds();
+        scheduleCloudSync(id);
+    });
 
     // ==========================================
     // Event: Incoming Messages
@@ -329,6 +444,7 @@ async function disconnectSession(merchantId) {
         await rm(sessionDir, { recursive: true, force: true });
     } catch (e) {}
 
+    await deleteSessionFromCloud(id);
     await notifyPHPStatus(id, 'disconnected', { reason: 'user_logout' });
     sessions.delete(id);
     return true;
@@ -451,19 +567,47 @@ app.post('/session/:merchantId/send', verifySecret, async (req, res) => {
 // AUTO RESTORE EXISTING SESSIONS ON STARTUP
 // ============================================
 async function restoreSessions() {
+    const restoredIds = new Set();
     try {
-        if (!existsSync(SESSIONS_BASE)) return;
-        const dirs = await readdir(SESSIONS_BASE, { withFileTypes: true });
-
-        for (const dir of dirs) {
-            if (dir.isDirectory() && dir.name.startsWith('merchant_')) {
-                const merchantId = dir.name.replace('merchant_', '');
-                console.log(`[Startup] Restoring session for merchant ${merchantId}...`);
-                connectSession(merchantId).catch(err => {
-                    console.error(`[Startup] Failed to restore merchant ${merchantId}:`, err.message);
-                });
+        // 1. Restore from local disk if folders exist
+        if (existsSync(SESSIONS_BASE)) {
+            const dirs = await readdir(SESSIONS_BASE, { withFileTypes: true });
+            for (const dir of dirs) {
+                if (dir.isDirectory() && dir.name.startsWith('merchant_')) {
+                    const merchantId = dir.name.replace('merchant_', '');
+                    restoredIds.add(String(merchantId));
+                    console.log(`[Startup] Restoring local session for merchant ${merchantId}...`);
+                    connectSession(merchantId).catch(err => {
+                        console.error(`[Startup] Failed to restore merchant ${merchantId}:`, err.message);
+                    });
+                }
             }
         }
+
+        // 2. Query PHP backend for active merchants with saved backups
+        try {
+            const activeRes = await fetch(`${PHP_BACKEND_URL}/api/bridge_session_sync.php?action=list_active`, {
+                headers: { 'X-Bridge-Secret': BRIDGE_SECRET },
+                signal: AbortSignal.timeout(10000),
+            });
+            if (activeRes.ok) {
+                const activeData = await activeRes.json();
+                if (activeData && activeData.success && Array.isArray(activeData.merchants)) {
+                    for (const mId of activeData.merchants) {
+                        const idStr = String(mId);
+                        if (!restoredIds.has(idStr)) {
+                            console.log(`[Startup] Restoring cloud-backed session for merchant ${idStr}...`);
+                            connectSession(idStr).catch(err => {
+                                console.error(`[Startup] Failed to restore cloud merchant ${idStr}:`, err.message);
+                            });
+                        }
+                    }
+                }
+            }
+        } catch (cloudErr) {
+            console.warn('[Startup] Cloud active sessions check:', cloudErr.message);
+        }
+
     } catch (err) {
         console.warn('[Startup] Error restoring sessions:', err.message);
     }
