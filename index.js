@@ -349,11 +349,11 @@ async function connectSession(merchantId) {
         return session;
     }
 
-    // Concurrency guard: If currently connecting and has an active socket + valid QR within last 60s, reuse it!
-    if (session.connectionState === 'connecting' && session.sock && session.qrCodeData) {
-        const qrAge = Date.now() - (session.lastQrTime || 0);
-        if (qrAge < 60000) {
-            console.log(`[Merchant ${id}] ⏳ Already connecting with valid QR (${Math.round(qrAge / 1000)}s old). Reusing existing socket.`);
+    // Concurrency guard: If currently connecting and has an active socket within last 45s, do NOT restart socket!
+    if (session.connectionState === 'connecting' && session.sock) {
+        const attemptAge = Date.now() - (session.lastConnectAttempt || 0);
+        if (attemptAge < 45000) {
+            console.log(`[Merchant ${id}] ⏳ Connection already in progress (${Math.round(attemptAge / 1000)}s ago). Reusing existing socket.`);
             return session;
         }
     }
@@ -586,6 +586,14 @@ app.get('/session/:merchantId/status', verifySecret, async (req, res) => {
 app.post('/session/:merchantId/connect', verifySecret, async (req, res) => {
     const { merchantId } = req.params;
     const session = await connectSession(merchantId);
+
+    // If QR is initializing and not ready yet, wait up to 3.5 seconds for it to arrive
+    if (!session.qrCodeData && session.connectionState === 'connecting') {
+        for (let i = 0; i < 18; i++) {
+            await delay(200);
+            if (session.qrCodeData || session.connectionState === 'connected') break;
+        }
+    }
 
     res.json({
         success: true,
