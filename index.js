@@ -176,10 +176,10 @@ async function forwardMessageToPHP(merchantId, phone, name, messageText, message
         if (result && result.reply && sock) {
             const targetJid = remoteJid || formatJID(phone);
 
-            // Natural typing delay
+            // Fast natural typing indicator
             try {
                 await sock.sendPresenceUpdate('composing', targetJid);
-                await delay(600 + Math.random() * 800);
+                await delay(200);
                 await sock.sendPresenceUpdate('paused', targetJid);
             } catch (e) {
                 // ignore presence error
@@ -571,6 +571,17 @@ app.get('/session/:merchantId/status', verifySecret, async (req, res) => {
     const { merchantId } = req.params;
     const session = await getOrCreateSession(merchantId);
 
+    // Auto-reconnect if session is disconnected and not currently attempting
+    if (session.connectionState === 'disconnected') {
+        const timeSinceAttempt = Date.now() - (session.lastConnectAttempt || 0);
+        if (timeSinceAttempt > 30000) {
+            console.log(`[Merchant ${merchantId}] 🔄 Session disconnected during status check. Triggering auto-reconnect...`);
+            connectSession(merchantId).catch(err => {
+                console.warn(`[Merchant ${merchantId}] Auto-reconnect on status check:`, err.message);
+            });
+        }
+    }
+
     res.json({
         merchant_id: merchantId,
         state: session.connectionState,
@@ -716,6 +727,7 @@ async function restoreSessions() {
                     for (const mId of activeData.merchants) {
                         const idStr = String(mId);
                         if (!restoredIds.has(idStr)) {
+                            restoredIds.add(idStr);
                             console.log(`[Startup] Restoring cloud-backed session for merchant ${idStr}...`);
                             connectSession(idStr).catch(err => {
                                 console.error(`[Startup] Failed to restore cloud merchant ${idStr}:`, err.message);
@@ -726,6 +738,14 @@ async function restoreSessions() {
             }
         } catch (cloudErr) {
             console.warn('[Startup] Cloud active sessions check:', cloudErr.message);
+        }
+
+        // 3. Always ensure primary usr_admin is reconnected on startup
+        if (!restoredIds.has('usr_admin')) {
+            console.log('[Startup] Auto-checking primary merchant usr_admin...');
+            connectSession('usr_admin').catch(err => {
+                console.warn('[Startup] usr_admin auto-connect:', err.message);
+            });
         }
 
     } catch (err) {
