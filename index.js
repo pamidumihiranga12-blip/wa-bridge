@@ -616,6 +616,104 @@ app.post('/session/:merchantId/connect', verifySecret, async (req, res) => {
 });
 
 /**
+ * POST /session/:merchantId/pairing-code
+ * Request an 8-digit WhatsApp pairing code for linking without camera
+ * Body: { phoneNumber: "94786800086" }
+ */
+app.post('/session/:merchantId/pairing-code', verifySecret, async (req, res) => {
+    const { merchantId } = req.params;
+    let { phoneNumber } = req.body;
+
+    if (!phoneNumber) {
+        return res.status(400).json({ success: false, error: 'phoneNumber is required' });
+    }
+
+    // Clean phone number: keep only digits
+    let cleanPhone = String(phoneNumber).replace(/[^0-9]/g, '');
+    if (cleanPhone.startsWith('0')) {
+        cleanPhone = '94' + cleanPhone.slice(1);
+    }
+    if (cleanPhone.startsWith('+')) {
+        cleanPhone = cleanPhone.slice(1);
+    }
+    if (cleanPhone.length === 9 && !cleanPhone.startsWith('94')) {
+        cleanPhone = '94' + cleanPhone;
+    }
+
+    try {
+        const session = await connectSession(merchantId);
+
+        if (session.connectionState === 'connected') {
+            return res.json({
+                success: true,
+                already_connected: true,
+                state: 'connected',
+                phone: session.phone
+            });
+        }
+
+        if (!session.sock) {
+            return res.status(500).json({ success: false, error: 'Socket initialization failed' });
+        }
+
+        // Wait up to 5 seconds for socket authState to be ready
+        for (let i = 0; i < 25; i++) {
+            if (session.sock.authState && session.sock.authState.creds) break;
+            await delay(200);
+        }
+
+        if (session.sock.authState && session.sock.authState.creds && session.sock.authState.creds.registered) {
+            return res.json({
+                success: true,
+                already_connected: true,
+                state: 'connected',
+                phone: session.phone
+            });
+        }
+
+        // Wait up to 6 seconds for websocket connection to be active
+        for (let i = 0; i < 20; i++) {
+            if (session.sock.ws && session.sock.ws.readyState === 1) break;
+            await delay(300);
+        }
+        await delay(1200);
+
+        console.log(`[Merchant ${merchantId}] 🔢 Requesting Baileys pairing code for phone: ${cleanPhone}...`);
+        let rawCode;
+        try {
+            rawCode = await session.sock.requestPairingCode(cleanPhone);
+        } catch (initialErr) {
+            console.warn(`[Merchant ${merchantId}] First pairing code attempt failed (${initialErr.message}). Retrying in 2s...`);
+            await delay(2000);
+            rawCode = await session.sock.requestPairingCode(cleanPhone);
+        }
+        
+        // Format code as XXXX-XXXX if it is an 8-char string
+        let formattedCode = rawCode;
+        if (rawCode && rawCode.length === 8) {
+            formattedCode = rawCode.slice(0, 4) + '-' + rawCode.slice(4);
+        }
+
+        console.log(`[Merchant ${merchantId}] ✅ Pairing code generated: ${formattedCode}`);
+
+        res.json({
+            success: true,
+            pairing_code: formattedCode,
+            raw_code: rawCode,
+            phone: cleanPhone,
+            expires_in_seconds: 120
+        });
+
+    } catch (err) {
+        console.error(`[Merchant ${merchantId}] ❌ Pairing code error:`, err);
+        res.status(500).json({
+            success: false,
+            error: err.message || 'Failed to request pairing code'
+        });
+    }
+});
+
+/**
  * POST /session/:merchantId/disconnect
  * Disconnect or Logout a merchant's WhatsApp
  */
