@@ -40,8 +40,8 @@ git push -u origin main
 Railway dashboard → ඔබේ project → **Variables** tab:
 
 ```
-PHP_BACKEND_URL  = https://yourdomain.com        (ඔබේ cPanel domain)
-BRIDGE_SECRET    = abc123randomsecret456xyz789   (random string)
+PHP_BACKEND_URL  = https://codflow.lk           (CodFlow production domain)
+BRIDGE_SECRET    = smartzone_baileys_secret_2026 (Bridge secret string)
 MERCHANT_ID      = 1                             (merchant ID)
 ```
 

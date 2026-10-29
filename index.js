@@ -4,7 +4,7 @@
  * - Supports MULTIPLE merchants simultaneously (Multi-Tenant)
  * - Each merchant has an isolated session in ./sessions/merchant_<id>
  * - Multi-tenant WhatsApp AI Assistant Bridge
- * - Connects to PHP backend (https://smartzonelk.com.lk)
+ * - Connects strictly to CodFlow OMS PHP backend (https://codflow.lk)
  */
 
 import makeWASocket, {
@@ -27,10 +27,16 @@ import 'dotenv/config';
 // ============================================
 // CONFIG
 // ============================================
-const PHP_BACKEND_URL = (process.env.PHP_BACKEND_URL || 'https://smartzonelk.com.lk').replace(/\/$/, '');
+// Connects strictly to https://codflow.lk PHP backend
+const PHP_BACKEND_URL = (process.env.PHP_BACKEND_URL || 'https://codflow.lk').replace(/\/$/, '');
 const BRIDGE_SECRET   = process.env.BRIDGE_SECRET   || 'smartzone_baileys_secret_2026';
 const PORT            = process.env.PORT            || 3000;
 const SESSIONS_BASE   = process.env.SESSION_DIR     || './sessions';
+
+const COMMON_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) CodFlowBaileysBridge/2.0',
+    'Accept': 'application/json, text/plain, */*'
+};
 
 const logger = pino({ level: 'silent' });
 
@@ -122,6 +128,7 @@ async function notifyPHPStatus(merchantId, event, data) {
         await fetch(`${PHP_BACKEND_URL}/api/bridge_status.php`, {
             method: 'POST',
             headers: {
+                ...COMMON_HEADERS,
                 'Content-Type': 'application/json',
                 'X-Bridge-Secret': BRIDGE_SECRET,
             },
@@ -143,6 +150,7 @@ async function forwardMessageToPHP(merchantId, phone, name, messageText, message
         const response = await fetch(`${PHP_BACKEND_URL}/api/bridge_receive.php`, {
             method: 'POST',
             headers: {
+                ...COMMON_HEADERS,
                 'Content-Type': 'application/json',
                 'X-Bridge-Secret': BRIDGE_SECRET,
             },
@@ -208,6 +216,8 @@ async function getOrCreateSession(merchantId) {
         merchantId: id,
         sock: null,
         qrCodeData: null,
+        lastQrTime: null,
+        lastConnectAttempt: null,
         connectionState: 'disconnected', // disconnected | connecting | connected
         phone: null,
         reconnectTimer: null,
@@ -250,10 +260,11 @@ async function syncSessionToCloud(merchantId) {
 
         if (Object.keys(filesObj).length === 0 || !filesObj['creds.json']) return;
 
-        console.log(`[Merchant ${id}] 📤 Syncing ${Object.keys(filesObj).length} session files to cloud backup...`);
+        console.log(`[Merchant ${id}] 📤 Syncing ${Object.keys(filesObj).length} session files to cloud backup (${PHP_BACKEND_URL})...`);
         const res = await fetch(`${PHP_BACKEND_URL}/api/bridge_session_sync.php`, {
             method: 'POST',
             headers: {
+                ...COMMON_HEADERS,
                 'Content-Type': 'application/json',
                 'X-Bridge-Secret': BRIDGE_SECRET,
             },
@@ -276,10 +287,14 @@ async function syncSessionToCloud(merchantId) {
 async function restoreSessionFromCloud(merchantId) {
     const id = String(merchantId);
     const sessionDir = path.join(SESSIONS_BASE, `merchant_${id}`);
+
     try {
-        console.log(`[Merchant ${id}] 📥 Checking cloud backup for saved credentials...`);
+        console.log(`[Merchant ${id}] 📥 Checking cloud backup for saved credentials on ${PHP_BACKEND_URL}...`);
         const res = await fetch(`${PHP_BACKEND_URL}/api/bridge_session_sync.php?action=load&merchant_id=${id}`, {
-            headers: { 'X-Bridge-Secret': BRIDGE_SECRET },
+            headers: {
+                ...COMMON_HEADERS,
+                'X-Bridge-Secret': BRIDGE_SECRET,
+            },
             signal: AbortSignal.timeout(10000),
         });
         if (!res.ok) return false;
@@ -293,11 +308,11 @@ async function restoreSessionFromCloud(merchantId) {
                 const buf = Buffer.from(base64Content, 'base64');
                 await writeFile(filePath, buf);
             }
-            console.log(`[Merchant ${id}] ✅ Restored ${Object.keys(data.files).length} session files from cloud!`);
+            console.log(`[Merchant ${id}] ✅ Restored ${Object.keys(data.files).length} session files from ${PHP_BACKEND_URL}!`);
             return true;
         }
     } catch (e) {
-        console.warn(`[Merchant ${id}] Failed to restore session from cloud:`, e.message);
+        console.warn(`[Merchant ${id}] Cloud restore probe failed on ${PHP_BACKEND_URL}:`, e.message);
     }
     return false;
 }
@@ -308,6 +323,7 @@ async function deleteSessionFromCloud(merchantId) {
         await fetch(`${PHP_BACKEND_URL}/api/bridge_session_sync.php`, {
             method: 'POST',
             headers: {
+                ...COMMON_HEADERS,
                 'Content-Type': 'application/json',
                 'X-Bridge-Secret': BRIDGE_SECRET,
             },
@@ -325,14 +341,34 @@ async function deleteSessionFromCloud(merchantId) {
 // ============================================
 async function connectSession(merchantId) {
     const session = await getOrCreateSession(merchantId);
+    const id = session.merchantId;
+    const sessionDir = path.join(SESSIONS_BASE, `merchant_${id}`);
 
-    // If already connected or connecting, return current session
+    // If already connected with an active socket, return current session
     if (session.connectionState === 'connected' && session.sock) {
         return session;
     }
 
-    const id = session.merchantId;
-    const sessionDir = path.join(SESSIONS_BASE, `merchant_${id}`);
+    // Concurrency guard: If currently connecting and has an active socket + valid QR within last 60s, reuse it!
+    if (session.connectionState === 'connecting' && session.sock && session.qrCodeData) {
+        const qrAge = Date.now() - (session.lastQrTime || 0);
+        if (qrAge < 60000) {
+            console.log(`[Merchant ${id}] ⏳ Already connecting with valid QR (${Math.round(qrAge / 1000)}s old). Reusing existing socket.`);
+            return session;
+        }
+    }
+
+    // Safely tear down any previous hanging socket before starting a fresh one
+    if (session.sock) {
+        try {
+            console.log(`[Merchant ${id}] 🧹 Cleaning up previous socket...`);
+            session.sock.ev.removeAllListeners();
+            session.sock.end(undefined);
+        } catch (e) {}
+        session.sock = null;
+    }
+
+    clearTimeout(session.reconnectTimer);
 
     if (!existsSync(sessionDir)) {
         await mkdir(sessionDir, { recursive: true });
@@ -345,6 +381,7 @@ async function connectSession(merchantId) {
 
     console.log(`[Merchant ${id}] 🔄 Connecting session...`);
     session.connectionState = 'connecting';
+    session.lastConnectAttempt = Date.now();
 
     const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
     const { version }          = await fetchLatestBaileysVersion();
@@ -355,9 +392,11 @@ async function connectSession(merchantId) {
         auth: state,
         browser: Browsers.ubuntu('Chrome'),
         printQRInTerminal: false,
-        retryRequestDelayMs: 2000,
+        retryRequestDelayMs: 2500,
         maxMsgRetryCount: 5,
         markOnlineOnConnect: false,
+        connectTimeoutMs: 60000,
+        keepAliveIntervalMs: 25000,
     });
 
     session.sock = sock;
@@ -371,6 +410,7 @@ async function connectSession(merchantId) {
         if (qr) {
             console.log(`[Merchant ${id}] 📱 New QR code generated`);
             session.connectionState = 'connecting';
+            session.lastQrTime = Date.now();
             try {
                 session.qrCodeData = await qrcode.toDataURL(qr);
                 await notifyPHPStatus(id, 'qr_update', { qr_base64: session.qrCodeData });
@@ -387,11 +427,10 @@ async function connectSession(merchantId) {
             console.log(`[Merchant ${id}] ❌ Connection closed. Code: ${statusCode}`);
 
             if (statusCode === DisconnectReason.loggedOut) {
-                console.log(`[Merchant ${id}] 🚪 Logged out. Session cleared.`);
+                console.log(`[Merchant ${id}] 🚪 Logged out event from WhatsApp. Clearing local directory.`);
                 session.phone = null;
                 await notifyPHPStatus(id, 'disconnected', { reason: 'logged_out' });
-                await deleteSessionFromCloud(id);
-                // Clean auth directory for fresh start
+                // Clean auth directory for fresh start, but preserve cloud backup so it is only deleted on deliberate user logout
                 try {
                     await rm(sessionDir, { recursive: true, force: true });
                 } catch (e) {}
@@ -417,6 +456,9 @@ async function connectSession(merchantId) {
             });
 
             // Ensure credentials are backed up immediately after successful link
+            scheduleCloudSync(id);
+        }
+    });
             scheduleCloudSync(id);
         }
     });
@@ -466,6 +508,7 @@ async function disconnectSession(merchantId) {
 
     try {
         if (session.sock) {
+            session.sock.ev.removeAllListeners();
             await session.sock.logout();
         }
     } catch (e) {
@@ -482,6 +525,7 @@ async function disconnectSession(merchantId) {
         await rm(sessionDir, { recursive: true, force: true });
     } catch (e) {}
 
+    // Explicit user logout: clear cloud backup in MySQL
     await deleteSessionFromCloud(id);
     await notifyPHPStatus(id, 'disconnected', { reason: 'user_logout' });
     sessions.delete(id);

@@ -10,7 +10,7 @@ services:
       - key: NODE_VERSION
         value: 18.18.0
       - key: PHP_BACKEND_URL
-        value: https://smartzonelk.com.lk
+        value: https://codflow.lk
       - key: BRIDGE_SECRET
         value: smartzone_baileys_secret_2026
 
