@@ -459,9 +459,6 @@ async function connectSession(merchantId) {
             scheduleCloudSync(id);
         }
     });
-            scheduleCloudSync(id);
-        }
-    });
 
     // ==========================================
     // Event: Save Credentials (Local + Cloud Backup)
