@@ -54,13 +54,53 @@ function formatJID(jidOrPhone) {
         return jidOrPhone.replace('@c.us', '@s.whatsapp.net');
     }
     const clean = jidOrPhone.replace(/[^0-9]/g, '');
-    if (clean.length > 13) {
+    if (clean.length > 12) {
         return clean + '@lid';
     }
     if (clean.startsWith('0') && clean.length === 10) {
         return '94' + clean.substring(1) + '@s.whatsapp.net';
     }
     return clean + '@s.whatsapp.net';
+}
+
+async function resolveSenderInfo(sock, msg) {
+    const remoteJid = msg.key?.remoteJid || '';
+    let realPhone = null;
+    const pushName = msg.pushName || '';
+
+    if (remoteJid.endsWith('@s.whatsapp.net')) {
+        realPhone = remoteJid.replace(/@.*/, '');
+    } else if (remoteJid.endsWith('@lid')) {
+        // 1. Check alternate properties in Baileys message key
+        const altJid = msg.key?.remoteJidAlt || msg.key?.participantAlt || msg.key?.participant || msg.participant;
+        if (altJid && typeof altJid === 'string' && altJid.endsWith('@s.whatsapp.net')) {
+            realPhone = altJid.replace(/@.*/, '');
+        }
+
+        // 2. Query Baileys signalRepository LID to Phone (PN) mapping cache
+        if (!realPhone) {
+            try {
+                if (sock?.signalRepository?.lidMapping?.getPNForLID) {
+                    const pnJid = await sock.signalRepository.lidMapping.getPNForLID(remoteJid);
+                    if (pnJid && typeof pnJid === 'string' && pnJid.endsWith('@s.whatsapp.net')) {
+                        realPhone = pnJid.replace(/@.*/, '');
+                    }
+                }
+            } catch (e) {
+                // not yet in LID cache
+            }
+        }
+    }
+
+    const senderPhone = realPhone || remoteJid.replace(/@.*/, '');
+    const senderName = pushName || (realPhone ? ('+' + realPhone) : 'WhatsApp User');
+
+    return {
+        senderPhone,
+        realPhone,
+        senderName,
+        senderJID: remoteJid
+    };
 }
 
 function extractMessageText(msg) {
@@ -403,9 +443,7 @@ async function connectSession(merchantId) {
             const messageText = extractMessageText(msg);
             if (!messageText) continue;
 
-            const senderJID   = msg.key.remoteJid;
-            const senderPhone = senderJID.replace(/@.*/, '');
-            const senderName  = msg.pushName || senderPhone;
+            const { senderPhone, senderName, senderJID } = await resolveSenderInfo(sock, msg);
 
             console.log(`[Merchant ${id}] 📩 Incoming from ${senderName} (${senderPhone}): "${messageText}"`);
 
@@ -549,6 +587,39 @@ app.post('/session/:merchantId/send', verifySecret, async (req, res) => {
         const jid = formatJID(phone);
 
         // Typing simulation
+        try {
+            await session.sock.sendPresenceUpdate('composing', jid);
+            await delay(400 + Math.random() * 600);
+            await session.sock.sendPresenceUpdate('paused', jid);
+        } catch (e) {}
+
+        const sendResult = await session.sock.sendMessage(jid, { text: message });
+        res.json({ success: true, messageId: sendResult.key?.id, to: jid });
+    } catch (err) {
+        console.error(`[Merchant ${merchantId}] Send error:`, err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+/**
+ * POST /send-message (Unified alias endpoint)
+ * Body: { merchant_id: 1, phone: "94786800086", message: "Hello!" }
+ */
+app.post('/send-message', verifySecret, async (req, res) => {
+    const merchantId = req.body.merchant_id || req.body.merchantId;
+    const { phone, message } = req.body;
+
+    if (!merchantId || !phone || !message) {
+        return res.status(400).json({ error: 'merchant_id, phone and message are required' });
+    }
+
+    const session = sessions.get(String(merchantId));
+    if (!session || session.connectionState !== 'connected' || !session.sock) {
+        return res.status(503).json({ error: `WhatsApp for merchant ${merchantId} is not connected` });
+    }
+
+    try {
+        const jid = formatJID(phone);
         try {
             await session.sock.sendPresenceUpdate('composing', jid);
             await delay(400 + Math.random() * 600);
