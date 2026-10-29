@@ -126,7 +126,7 @@ async function notifyPHPStatus(merchantId, event, data) {
                 'X-Bridge-Secret': BRIDGE_SECRET,
             },
             body: JSON.stringify({
-                merchant_id: parseInt(merchantId, 10),
+                merchant_id: String(merchantId),
                 event,
                 data,
                 timestamp: Date.now(),
@@ -147,7 +147,7 @@ async function forwardMessageToPHP(merchantId, phone, name, messageText, message
                 'X-Bridge-Secret': BRIDGE_SECRET,
             },
             body: JSON.stringify({
-                merchant_id: parseInt(merchantId, 10),
+                merchant_id: String(merchantId),
                 phone,
                 name,
                 message: messageText,
@@ -259,7 +259,7 @@ async function syncSessionToCloud(merchantId) {
             },
             body: JSON.stringify({
                 action: 'save',
-                merchant_id: parseInt(id, 10),
+                merchant_id: String(id),
                 files: filesObj,
             }),
             signal: AbortSignal.timeout(15000),
@@ -313,7 +313,7 @@ async function deleteSessionFromCloud(merchantId) {
             },
             body: JSON.stringify({
                 action: 'delete',
-                merchant_id: parseInt(id, 10),
+                merchant_id: String(id),
             }),
             signal: AbortSignal.timeout(8000),
         });
