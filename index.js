@@ -13,6 +13,7 @@ import makeWASocket, {
     fetchLatestBaileysVersion,
     Browsers,
     delay,
+    downloadMediaMessage,
 } from '@whiskeysockets/baileys';
 import express from 'express';
 import pino from 'pino';
@@ -145,8 +146,21 @@ async function notifyPHPStatus(merchantId, event, data) {
     }
 }
 
-async function forwardMessageToPHP(merchantId, phone, name, messageText, messageId, sock, remoteJid) {
+async function forwardMessageToPHP(merchantId, phone, name, messageText, messageId, sock, remoteJid, imageBase64 = null, mimeType = 'image/jpeg') {
     try {
+        const payload = {
+            merchant_id: String(merchantId),
+            phone,
+            name,
+            message: messageText,
+            message_id: messageId,
+            timestamp: Date.now(),
+        };
+        if (imageBase64) {
+            payload.image_base64 = imageBase64;
+            payload.mime_type = mimeType;
+        }
+
         const response = await fetch(`${PHP_BACKEND_URL}/api/bridge_receive.php`, {
             method: 'POST',
             headers: {
@@ -154,14 +168,7 @@ async function forwardMessageToPHP(merchantId, phone, name, messageText, message
                 'Content-Type': 'application/json',
                 'X-Bridge-Secret': BRIDGE_SECRET,
             },
-            body: JSON.stringify({
-                merchant_id: String(merchantId),
-                phone,
-                name,
-                message: messageText,
-                message_id: messageId,
-                timestamp: Date.now(),
-            }),
+            body: JSON.stringify(payload),
             signal: AbortSignal.timeout(35000),
         });
 
@@ -172,8 +179,8 @@ async function forwardMessageToPHP(merchantId, phone, name, messageText, message
 
         const result = await response.json();
 
-        // If PHP returns a reply, send it out immediately via WhatsApp
-        if (result && result.reply && sock) {
+        // If PHP returns a reply or image_url, send it out immediately via WhatsApp
+        if (result && (result.reply || result.image_url) && sock) {
             const targetJid = remoteJid || formatJID(phone);
 
             // Fast natural typing indicator
@@ -186,13 +193,28 @@ async function forwardMessageToPHP(merchantId, phone, name, messageText, message
             }
 
             try {
-                await sock.sendMessage(targetJid, { text: result.reply });
-                console.log(`[Merchant ${merchantId}] 📤 Sent reply to ${targetJid}: ${result.reply.substring(0, 40)}...`);
+                if (result.image_url) {
+                    await sock.sendMessage(targetJid, {
+                        image: { url: result.image_url },
+                        caption: result.reply || ''
+                    });
+                    console.log(`[Merchant ${merchantId}] 📸 Sent image reply to ${targetJid}: ${result.image_url}`);
+                } else if (result.reply) {
+                    await sock.sendMessage(targetJid, { text: result.reply });
+                    console.log(`[Merchant ${merchantId}] 📤 Sent text reply to ${targetJid}: ${result.reply.substring(0, 40)}...`);
+                }
             } catch (sendErr) {
                 console.warn(`[Merchant ${merchantId}] Failed to send to ${targetJid}, trying fallback:`, sendErr.message);
                 if (targetJid && targetJid.includes('@lid')) {
                     const fallbackJid = formatJID(phone);
-                    await sock.sendMessage(fallbackJid, { text: result.reply });
+                    if (result.image_url) {
+                        await sock.sendMessage(fallbackJid, {
+                            image: { url: result.image_url },
+                            caption: result.reply || ''
+                        });
+                    } else if (result.reply) {
+                        await sock.sendMessage(fallbackJid, { text: result.reply });
+                    }
                     console.log(`[Merchant ${merchantId}] 📤 Fallback sent to ${fallbackJid}`);
                 }
             }
@@ -392,6 +414,8 @@ async function connectSession(merchantId) {
         auth: state,
         browser: Browsers.ubuntu('Chrome'),
         printQRInTerminal: false,
+        syncFullHistory: false,
+        generateHighQualityLinkPreview: false,
         retryRequestDelayMs: 2500,
         maxMsgRetryCount: 5,
         markOnlineOnConnect: false,
@@ -437,11 +461,15 @@ async function connectSession(merchantId) {
             } else if (statusCode === DisconnectReason.connectionReplaced) {
                 console.log(`[Merchant ${id}] 📱 Connection replaced by another session.`);
                 await notifyPHPStatus(id, 'disconnected', { reason: 'replaced' });
-            } else {
-                // Auto reconnect after 5s
-                console.log(`[Merchant ${id}] 🔄 Reconnecting in 5 seconds...`);
+            } else if (statusCode === DisconnectReason.restartRequired || statusCode === 515) {
+                console.log(`[Merchant ${id}] 🔄 Restart required (Pairing handshake complete). Reconnecting immediately...`);
                 clearTimeout(session.reconnectTimer);
-                session.reconnectTimer = setTimeout(() => connectSession(id), 5000);
+                session.reconnectTimer = setTimeout(() => connectSession(id), 500);
+            } else {
+                // Auto reconnect after 3s
+                console.log(`[Merchant ${id}] 🔄 Reconnecting in 3 seconds...`);
+                clearTimeout(session.reconnectTimer);
+                session.reconnectTimer = setTimeout(() => connectSession(id), 3000);
             }
 
         } else if (connection === 'open') {
@@ -479,14 +507,26 @@ async function connectSession(merchantId) {
             if (msg.key.remoteJid === 'status@broadcast') continue;
             if (msg.key.remoteJid?.endsWith('@g.us')) continue;
 
-            const messageText = extractMessageText(msg);
-            if (!messageText) continue;
+            let imageBase64 = null;
+            let mimeType = 'image/jpeg';
+            if (msg.message?.imageMessage) {
+                try {
+                    const buffer = await downloadMediaMessage(msg, 'buffer', {});
+                    imageBase64 = buffer.toString('base64');
+                    mimeType = msg.message.imageMessage.mimetype || 'image/jpeg';
+                } catch (imgErr) {
+                    console.warn(`[Merchant ${id}] Failed to download media image:`, imgErr.message);
+                }
+            }
+
+            const messageText = extractMessageText(msg) || (imageBase64 ? 'Customer sent an image. Please inspect it.' : null);
+            if (!messageText && !imageBase64) continue;
 
             const { senderPhone, senderName, senderJID } = await resolveSenderInfo(sock, msg);
 
-            console.log(`[Merchant ${id}] 📩 Incoming from ${senderName} (${senderPhone}): "${messageText}"`);
+            console.log(`[Merchant ${id}] 📩 Incoming from ${senderName} (${senderPhone}): "${messageText}" ${imageBase64 ? '[IMAGE ATTACHED]' : ''}`);
 
-            await forwardMessageToPHP(id, senderPhone, senderName, messageText, msg.key.id, sock, senderJID);
+            await forwardMessageToPHP(id, senderPhone, senderName, messageText, msg.key.id, sock, senderJID, imageBase64, mimeType);
         }
     });
 
@@ -641,6 +681,20 @@ app.post('/session/:merchantId/pairing-code', verifySecret, async (req, res) => 
     }
 
     try {
+        // If there is an existing incomplete or connecting session, reset it so pairing code gets a clean fresh socket
+        if (sessions.has(merchantId)) {
+            const currentSession = sessions.get(merchantId);
+            if (currentSession.connectionState === 'connected') {
+                return res.json({
+                    success: true,
+                    already_connected: true,
+                    state: 'connected',
+                    phone: currentSession.phone
+                });
+            }
+            await disconnectSession(merchantId);
+        }
+
         const session = await connectSession(merchantId);
 
         if (session.connectionState === 'connected') {
