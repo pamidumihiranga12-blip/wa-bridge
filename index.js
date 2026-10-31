@@ -57,15 +57,15 @@ if (!existsSync(SESSIONS_BASE)) {
 // ============================================
 function formatJID(jidOrPhone) {
     if (typeof jidOrPhone !== 'string') return '';
+    if (jidOrPhone.includes('@lid')) {
+        return jidOrPhone;
+    }
     if (jidOrPhone.includes('@')) {
         return jidOrPhone.replace('@c.us', '@s.whatsapp.net');
     }
-    const clean = jidOrPhone.replace(/[^0-9]/g, '');
-    if (clean.length > 12) {
-        return clean + '@lid';
-    }
+    let clean = jidOrPhone.replace(/[^0-9]/g, '');
     if (clean.startsWith('0') && clean.length === 10) {
-        return '94' + clean.substring(1) + '@s.whatsapp.net';
+        clean = '94' + clean.substring(1);
     }
     return clean + '@s.whatsapp.net';
 }
@@ -111,12 +111,21 @@ async function resolveSenderInfo(sock, msg) {
 }
 
 function extractMessageText(msg) {
+    const m = msg.message;
+    if (!m) return null;
+
+    // Ephemeral / View Once unwrapping
+    const unwrapped = m.ephemeralMessage?.message || m.viewOnceMessage?.message || m.viewOnceMessageV2?.message || m;
+
     return (
-        msg.message?.conversation ||
-        msg.message?.extendedTextMessage?.text ||
-        msg.message?.imageMessage?.caption ||
-        msg.message?.videoMessage?.caption ||
-        msg.message?.documentMessage?.caption ||
+        unwrapped.conversation ||
+        unwrapped.extendedTextMessage?.text ||
+        unwrapped.imageMessage?.caption ||
+        unwrapped.videoMessage?.caption ||
+        unwrapped.documentMessage?.caption ||
+        unwrapped.buttonsResponseMessage?.selectedButtonId ||
+        unwrapped.templateButtonReplyMessage?.selectedId ||
+        unwrapped.interactiveResponseMessage?.body?.text ||
         null
     );
 }
@@ -192,30 +201,47 @@ async function forwardMessageToPHP(merchantId, phone, name, messageText, message
                 // ignore presence error
             }
 
-            try {
-                if (result.image_url) {
+            let sentImage = false;
+            if (result.image_url) {
+                try {
                     await sock.sendMessage(targetJid, {
                         image: { url: result.image_url },
                         caption: result.reply || ''
                     });
+                    sentImage = true;
                     console.log(`[Merchant ${merchantId}] 📸 Sent image reply to ${targetJid}: ${result.image_url}`);
-                } else if (result.reply) {
+                } catch (sendImgErr) {
+                    console.warn(`[Merchant ${merchantId}] Image send failed (${sendImgErr.message}). Falling back to text...`);
+                    if (targetJid && targetJid.includes('@lid') && phone) {
+                        try {
+                            const fallbackJid = formatJID(phone);
+                            await sock.sendMessage(fallbackJid, {
+                                image: { url: result.image_url },
+                                caption: result.reply || ''
+                            });
+                            sentImage = true;
+                            console.log(`[Merchant ${merchantId}] 📸 Image fallback sent to ${fallbackJid}`);
+                        } catch (e2) {}
+                    }
+                }
+            }
+
+            // If image wasn't sent (or no image requested), send text reply
+            if (!sentImage && result.reply) {
+                try {
                     await sock.sendMessage(targetJid, { text: result.reply });
                     console.log(`[Merchant ${merchantId}] 📤 Sent text reply to ${targetJid}: ${result.reply.substring(0, 40)}...`);
-                }
-            } catch (sendErr) {
-                console.warn(`[Merchant ${merchantId}] Failed to send to ${targetJid}, trying fallback:`, sendErr.message);
-                if (targetJid && targetJid.includes('@lid')) {
-                    const fallbackJid = formatJID(phone);
-                    if (result.image_url) {
-                        await sock.sendMessage(fallbackJid, {
-                            image: { url: result.image_url },
-                            caption: result.reply || ''
-                        });
-                    } else if (result.reply) {
-                        await sock.sendMessage(fallbackJid, { text: result.reply });
+                } catch (sendErr) {
+                    console.warn(`[Merchant ${merchantId}] Failed to send to ${targetJid}, trying fallback:`, sendErr.message);
+                    if (targetJid && targetJid.includes('@lid') && phone) {
+                        try {
+                            const fallbackJid = formatJID(phone);
+                            await sock.sendMessage(fallbackJid, { text: result.reply });
+                            console.log(`[Merchant ${merchantId}] 📤 Fallback sent to ${fallbackJid}`);
+                        } catch (e3) {
+                            console.error(`[Merchant ${merchantId}] All fallback text sends failed:`, e3.message);
+                        }
                     }
-                    console.log(`[Merchant ${merchantId}] 📤 Fallback sent to ${fallbackJid}`);
                 }
             }
         }
@@ -500,12 +526,21 @@ async function connectSession(merchantId) {
     // Event: Incoming Messages
     // ==========================================
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
-        if (type !== 'notify') return;
-
+        // Allow live 'notify' messages, and recent 'append' messages (< 15 mins old) from reconnect / waking up
         for (const msg of messages) {
             if (msg.key.fromMe) continue;
             if (msg.key.remoteJid === 'status@broadcast') continue;
             if (msg.key.remoteJid?.endsWith('@g.us')) continue;
+
+            // If message was received via 'append' (offline sync upon reconnecting), ignore only if older than 15 mins
+            if (type === 'append') {
+                const nowSec = Math.floor(Date.now() / 1000);
+                const msgSec = Number(msg.messageTimestamp || 0);
+                const ageSec = nowSec - msgSec;
+                if (msgSec > 0 && ageSec > 900) {
+                    continue; // Skip ancient history messages
+                }
+            }
 
             let imageBase64 = null;
             let mimeType = 'image/jpeg';
@@ -912,4 +947,14 @@ app.listen(PORT, async () => {
     console.log(`📡 Connected PHP Backend: ${PHP_BACKEND_URL}`);
     console.log(`===============================================`);
     await restoreSessions();
+
+    // Keepalive self-ping every 8 minutes to prevent Render free-tier containers from spinning down
+    setInterval(async () => {
+        try {
+            const selfUrl = process.env.RENDER_EXTERNAL_URL ? `${process.env.RENDER_EXTERNAL_URL}/health` : 'https://wa-bridge-293f.onrender.com/health';
+            await fetch(selfUrl, { signal: AbortSignal.timeout(5000) });
+            // Also keep alive PHP backend
+            await fetch(`${PHP_BACKEND_URL}/api/cron_keepalive.php`, { signal: AbortSignal.timeout(8000) });
+        } catch (e) {}
+    }, 8 * 60 * 1000);
 });
